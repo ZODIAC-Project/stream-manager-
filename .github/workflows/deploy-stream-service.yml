@@ -8,7 +8,7 @@ on:
       - '.github/workflows/deploy-stream-service.yaml'
 
 env:
-  REGISTRY: git.
+  REGISTRY: git.tu-berlin.de:5000/zodiac/zodiac-meta
 
   IMAGE_NAME: stream-manager
   CONTEXT: ./src/
