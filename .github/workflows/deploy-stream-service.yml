@@ -3,9 +3,6 @@ name: Deploy Stream Manager
 on:
   push:
     branches: ["main"]
-    paths:
-      - './'
-      - '.github/workflows/deploy-stream-service.yaml'
 
 env:
   REGISTRY: git.tu-berlin.de:5000/zodiac/zodiac-meta
