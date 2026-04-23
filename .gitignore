@@ -1,0 +1,4 @@
+*.env
+token-file.txt
+__pycache__/
+uv.locks
