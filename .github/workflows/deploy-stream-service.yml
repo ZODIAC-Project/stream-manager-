@@ -4,7 +4,7 @@ on:
   push:
     branches: ["main"]
     paths:
-      - 'src/**'
+      - './'
       - '.github/workflows/deploy-stream-service.yaml'
 
 env:
