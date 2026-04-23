@@ -28,7 +28,6 @@ Notes:
         "image: <image-name>..." so it can be replaced correctly.
 USAGE
 }
-
 # Print the usage info if requested 
 if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
         usage
