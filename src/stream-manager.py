@@ -178,6 +178,36 @@ class MQTTStreamManager:
                         await self._pending_subscribes.put(("unsubscribe", topic))
 
         logger.info(f"Session {session_id} cleaned up.")
+        
+    async def get_all_subscriptions(self) -> dict:
+        async with self.state_lock:
+            return {
+                "sessions": [
+                    {
+                        "session_id": state.session_id,
+                        "consumer_type": state.consumer_type,
+                        "callback_url": state.callback_url,
+                        "topics": sorted(state.topics),
+                    }
+                    for state in self.sessions.values()
+                ],
+                "topics": {
+                    topic: sorted(list(session_ids))
+                    for topic, session_ids in self.topic_sessions.items()
+                }
+            }
+            
+    async def get_session_subscriptions(self, session_id: str) -> Optional[dict]:
+        async with self.state_lock:
+            state = self.sessions.get(session_id)
+            if not state:
+                return None
+            return {
+                "session_id": state.session_id,
+                "consumer_type": state.consumer_type,
+                "callback_url": state.callback_url,
+                "topics": sorted(state.topics)
+            }
 
     # ------------------------------------------------------------------
     # WebSocket management (browser sessions)
@@ -369,6 +399,22 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
         await manager.remove_websocket(session_id, websocket)
         await manager.cleanup_session(session_id)
         logger.info(f"Browser WebSocket disconnected for session {session_id}")
+# ---------------------------------------------------------------------------
+# Getting infos about current subscriptions 
+# ---------------------------------------------------------------------------      
+        
+@app.get("/subscriptions")
+async def list_subscriptions():
+    manager: MQTTStreamManager = app.state.manager
+    return await manager.get_all_subscriptions()
+
+@app.get("/subscriptions/{session_id}")
+async def get_session_subscriptions(session_id: str):
+    manager: MQTTStreamManager = app.state.manager
+    result = await manager.get_session_subscriptions(session_id)
+    if result is None:
+        return JSONResponse(status_code=404, content={"error": "Session not found"})
+    return result  
 
 # ---------------------------------------------------------------------------
 # Health
