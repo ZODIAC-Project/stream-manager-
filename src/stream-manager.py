@@ -30,9 +30,8 @@ logger = logging.getLogger('stream-service')
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-mqtt_broker        = os.getenv('MQTT_BROKER')
-agent_callback_port = os.getenv('AGENT_CALLBACK_PORT', '8080')
-agent_callback_path = os.getenv('AGENT_CALLBACK_PATH', '/ingest')
+mqtt_broker            = os.getenv('MQTT_BROKER')
+agent_server_url       = os.getenv('AGENT_SERVER_URL', 'http://localhost:8000/agents').rstrip('/')
 max_topics_per_session = int(os.getenv('MAX_TOPICS_PER_SESSION', '20'))
 
 if mqtt_broker is None:
@@ -44,10 +43,12 @@ else:
 # Data models
 # ---------------------------------------------------------------------------
 class SubscribeRequest(BaseModel):
-    session_id: str
-    topic: str
-    consumer_type: str          # "browser" or "agent"
-    callback_url: Optional[str] = None   # agent only, overrides auto-constructed URL
+    session_id: str # Session of the user that request subscription
+    topic: str # MQTT topic to subscribe to
+    text: str # Text that is used as instruction for the agent                         
+    purposes: list[str] = [] # PBAC purposes 
+    memory_window: int = 5 
+    agent_server_url: Optional[str] = None  # overrides AGENT_SERVER_URL env var
 
 class UnsubscribeRequest(BaseModel):
     session_id: str
@@ -56,19 +57,20 @@ class UnsubscribeRequest(BaseModel):
 # ---------------------------------------------------------------------------
 # Session state
 # Tracks for each session_id:
-#   - consumer_type
-#   - callback_url (agents)
-#   - active WebSocket connections (browsers)
 #   - which topics are subscribed
+#   - agent config (text, purposes, memory_window, agent_server_url)
+#   - agent_id returned by /agents after first message triggers creation
 # ---------------------------------------------------------------------------
 class SessionState:
-    def __init__(self, session_id: str, consumer_type: str, callback_url: Optional[str]):
-        self.session_id    = session_id
-        self.consumer_type = consumer_type
-        self.callback_url  = callback_url
-        self.topics: Set[str] = set()
-        self.websockets: Set[WebSocket] = set()
-        self.ws_lock  = asyncio.Lock()
+    def __init__(self, session_id: str, text: str, purposes: list,
+                 memory_window: int, agent_server_url: str):
+        self.session_id             = session_id
+        self.topics: Set[str]       = set()
+        self.text                   = text
+        self.purposes               = purposes
+        self.memory_window          = memory_window
+        self.agent_server_url       = agent_server_url
+        self.agent_id: Optional[str] = None  # set after /agents responds on first message
 
 # ---------------------------------------------------------------------------
 # Shared MQTT Manager
@@ -108,16 +110,14 @@ class MQTTStreamManager:
     # ------------------------------------------------------------------
     # Public API called by HTTP endpoints
     # ------------------------------------------------------------------
-    async def register_session(
-        self,
-        session_id: str,
-        consumer_type: str,
-        callback_url: Optional[str]
-    ) -> bool:
+    async def register_session(self, session_id: str, text: str, purposes: list,
+                                memory_window: int, agent_server_url: str) -> bool:
         """Register a session if not already known. Returns True if new."""
         async with self.state_lock:
             if session_id not in self.sessions:
-                self.sessions[session_id] = SessionState(session_id, consumer_type, callback_url)
+                self.sessions[session_id] = SessionState(
+                    session_id, text, purposes, memory_window, agent_server_url
+                )
                 return True
             return False
 
@@ -177,17 +177,26 @@ class MQTTStreamManager:
                         del self.topic_sessions[topic]
                         await self._pending_subscribes.put(("unsubscribe", topic))
 
+        # Notify agent-manager to stop the agent (delete endpoint )
+        if state.agent_id:
+            url = f"{state.agent_server_url}/{state.agent_id}"
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    await client.delete(url)
+                    logger.info(f"Agent {state.agent_id} deleted for session {session_id}")
+            except Exception as e:
+                logger.error(f"Failed to delete agent {state.agent_id}: {e}")
+
         logger.info(f"Session {session_id} cleaned up.")
-        
+
     async def get_all_subscriptions(self) -> dict:
         async with self.state_lock:
             return {
                 "sessions": [
                     {
                         "session_id": state.session_id,
-                        "consumer_type": state.consumer_type,
-                        "callback_url": state.callback_url,
-                        "topics": sorted(state.topics),
+                        "agent_id":   state.agent_id,
+                        "topics":     sorted(state.topics),
                     }
                     for state in self.sessions.values()
                 ],
@@ -196,7 +205,7 @@ class MQTTStreamManager:
                     for topic, session_ids in self.topic_sessions.items()
                 }
             }
-            
+
     async def get_session_subscriptions(self, session_id: str) -> Optional[dict]:
         async with self.state_lock:
             state = self.sessions.get(session_id)
@@ -204,27 +213,9 @@ class MQTTStreamManager:
                 return None
             return {
                 "session_id": state.session_id,
-                "consumer_type": state.consumer_type,
-                "callback_url": state.callback_url,
-                "topics": sorted(state.topics)
+                "agent_id":   state.agent_id,
+                "topics":     sorted(state.topics),
             }
-
-    # ------------------------------------------------------------------
-    # WebSocket management (browser sessions)
-    # ------------------------------------------------------------------
-    async def add_websocket(self, session_id: str, ws: WebSocket):
-        async with self.state_lock:
-            state = self.sessions.get(session_id)
-        if state:
-            async with state.ws_lock:
-                state.websockets.add(ws)
-
-    async def remove_websocket(self, session_id: str, ws: WebSocket):
-        async with self.state_lock:
-            state = self.sessions.get(session_id)
-        if state:
-            async with state.ws_lock:
-                state.websockets.discard(ws)
 
     # ------------------------------------------------------------------
     # Shared MQTT listener — one connection for all topics
@@ -248,9 +239,10 @@ class MQTTStreamManager:
                         tg.create_task(self._pending_loop(client))
 
             except* asyncio.CancelledError:
-                raise
-            except* Exception as e:
-                logger.error(f"MQTT connection error: {e}. Reconnecting in 5s...")
+                raise asyncio.CancelledError()
+            except* Exception as eg:
+                for e in eg.exceptions:
+                    logger.error(f"MQTT connection error: {e}. Reconnecting in 5s...")
                 self._mqtt_client = None
                 await asyncio.sleep(5)
 
@@ -288,33 +280,45 @@ class MQTTStreamManager:
                 logger.error(f"Failed to {action} {topic}: {e}")
 
     # ------------------------------------------------------------------
-    # Forwarding — browser via WebSocket, agent via HTTP callback
+    # Forwarding — to agent-manager 
     # ------------------------------------------------------------------
     async def _forward(self, state: SessionState, data: dict):
-        if state.consumer_type == "browser":
-            await self._forward_ws(state, data)
-        elif state.consumer_type == "agent":
-            await self._forward_http(state, data)
+        await self._forward_to_agent(state, data)
 
-    async def _forward_ws(self, state: SessionState, data: dict):
-        async with state.ws_lock:
-            dead = set()
-            for ws in list(state.websockets):
-                try:
-                    await ws.send_json(data)
-                except Exception:
-                    dead.add(ws)
-            state.websockets -= dead
+    async def _forward_to_agent(self, state: SessionState, data: dict):
+        url = state.agent_server_url
 
-    async def _forward_http(self, state: SessionState, data: dict):
-        if not state.callback_url:
-            logger.warning(f"Agent session {state.session_id} has no callback_url, dropping message.")
-            return
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                await client.post(state.callback_url, json=data)
-        except Exception as e:
-            logger.error(f"HTTP callback failed for session {state.session_id}: {e}")
+        if state.agent_id is None:
+            # Agent not created yet — create it now on first incoming message
+            combined_text = f"{state.text}\n\nData: {data['payload']}"
+            create_payload = {
+                "intervalMs":   0,
+                "runOnce":      True,
+                "text":         combined_text,
+                "purposes":     state.purposes,
+                "memoryWindow": state.memory_window,
+            }
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    resp = await client.post(url, json=create_payload)
+                    resp.raise_for_status()
+                    state.agent_id = resp.json()["id"]
+                    logger.info(f"Agent {state.agent_id} created for session {state.session_id}")
+            except Exception as e:
+                logger.error(f"Agent creation failed for session {state.session_id}: {e}. Cleaning up.")
+                await self.cleanup_session(state.session_id)
+        else:
+            # Agent already running — forward the new datapoint
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    resp = await client.post(
+                        f"{url}/{state.agent_id}",
+                        json={"datapoint": data["payload"]}
+                    )
+                    resp.raise_for_status()
+                    logger.info(f"Datapoint forwarded to agent {state.agent_id}")
+            except Exception as e:
+                logger.error(f"Datapoint forward failed for agent {state.agent_id}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -337,26 +341,21 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------------
-# HTTP endpoints (called by MCP-Client)
+# HTTP endpoints
 # ---------------------------------------------------------------------------
 @app.post("/subscribe")
-async def subscribe(req: SubscribeRequest, request: Request):
+async def subscribe(req: SubscribeRequest):
     manager: MQTTStreamManager = app.state.manager
 
-    # Resolve callback URL for agents
-    callback_url = None
-    if req.consumer_type == "agent":
-        if req.callback_url:
-            callback_url = req.callback_url
-        else:
-            origin_ip = request.client.host
-            callback_url = f"http://{origin_ip}:{agent_callback_port}{agent_callback_path}"
-            logger.info(f"Auto-constructed callback URL for agent: {callback_url}")
+    url = req.agent_server_url or agent_server_url
 
-    elif req.consumer_type != "browser":
-        return JSONResponse(status_code=400, content={"error": f"Unknown consumer_type: {req.consumer_type}"})
-
-    await manager.register_session(req.session_id, req.consumer_type, callback_url)
+    await manager.register_session(
+        session_id=req.session_id,
+        text=req.text,
+        purposes=req.purposes,
+        memory_window=req.memory_window,
+        agent_server_url=url,
+    )
     result = await manager.subscribe(req.session_id, req.topic)
     return {"session_id": req.session_id, "result": result}
 
@@ -373,36 +372,8 @@ async def cleanup(session_id: str):
     return {"session_id": session_id, "result": "cleaned up"}
 
 # ---------------------------------------------------------------------------
-# WebSocket endpoint (browsers connect here directly after subscribing)
+# Subscription info endpoints
 # ---------------------------------------------------------------------------
-@app.websocket("/ws/{session_id}")
-async def websocket_endpoint(websocket: WebSocket, session_id: str):
-    manager: MQTTStreamManager = app.state.manager
-
-    await websocket.accept()
-    await manager.add_websocket(session_id, websocket)
-    logger.info(f"Browser WebSocket connected for session {session_id}")
-
-    try:
-        while True:
-            try:
-                await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
-            except asyncio.TimeoutError:
-                # Client is quiet — send a ping to verify it's still alive
-                try:
-                    await websocket.send_json({"type": "ping"})
-                except Exception:
-                    break  # Can't reach client, treat as disconnect
-    except (WebSocketDisconnect, Exception):
-        pass
-    finally:
-        await manager.remove_websocket(session_id, websocket)
-        await manager.cleanup_session(session_id)
-        logger.info(f"Browser WebSocket disconnected for session {session_id}")
-# ---------------------------------------------------------------------------
-# Getting infos about current subscriptions 
-# ---------------------------------------------------------------------------      
-        
 @app.get("/subscriptions")
 async def list_subscriptions():
     manager: MQTTStreamManager = app.state.manager
@@ -414,7 +385,7 @@ async def get_session_subscriptions(session_id: str):
     result = await manager.get_session_subscriptions(session_id)
     if result is None:
         return JSONResponse(status_code=404, content={"error": "Session not found"})
-    return result  
+    return result
 
 # ---------------------------------------------------------------------------
 # Health
