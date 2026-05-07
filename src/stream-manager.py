@@ -79,7 +79,7 @@ class SessionState:
         self.agent_server_url       = agent_server_url
         self.agent_id: Optional[str] = None  # set after /agents responds on first message
         # browser options
-        self.webscokets: Set[WebSocket] = set()
+        self.websockets: Set[WebSocket] = set()
         self.ws_lock = asyncio.Lock()
         
 
