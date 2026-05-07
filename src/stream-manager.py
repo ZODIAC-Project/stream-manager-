@@ -69,12 +69,13 @@ class UnsubscribeRequest(BaseModel):
 # ---------------------------------------------------------------------------
 class SessionState:
     def __init__(self, session_id: str, text: str, purposes: list,
-                 memory_window: int, agent_server_url: str):
+                 memory_window: int, agent_server_url: str, consumer_type: str = "agent"):
         self.session_id             = session_id
         self.topics: Set[str]       = set()
         self.text                   = text
         self.purposes               = purposes
         self.memory_window          = memory_window
+        self.consumer_type          = consumer_type
         self.agent_server_url       = agent_server_url
         self.agent_id: Optional[str] = None  # set after /agents responds on first message
         # browser options
