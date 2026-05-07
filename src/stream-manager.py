@@ -49,10 +49,16 @@ class SubscribeRequest(BaseModel):
     purposes: list[str] = [] # PBAC purposes 
     memory_window: int = 5 
     agent_server_url: Optional[str] = None  # overrides AGENT_SERVER_URL env var
+    
+class BrowserSubscribeRequest(BaseModel):
+    session_id: str
+    topic: str
+    purposes: list[str] = []
 
 class UnsubscribeRequest(BaseModel):
     session_id: str
     topic: str
+    
 
 # ---------------------------------------------------------------------------
 # Session state
@@ -71,6 +77,10 @@ class SessionState:
         self.memory_window          = memory_window
         self.agent_server_url       = agent_server_url
         self.agent_id: Optional[str] = None  # set after /agents responds on first message
+        # browser options
+        self.webscokets: Set[WebSocket] = set()
+        self.ws_lock = asyncio.Lock()
+        
 
 # ---------------------------------------------------------------------------
 # Shared MQTT Manager
@@ -111,12 +121,12 @@ class MQTTStreamManager:
     # Public API called by HTTP endpoints
     # ------------------------------------------------------------------
     async def register_session(self, session_id: str, text: str, purposes: list,
-                                memory_window: int, agent_server_url: str) -> bool:
-        """Register a session if not already known. Returns True if new."""
+                                memory_window: int, agent_server_url: str,
+                                consumer_type: str = "agent") -> bool:
         async with self.state_lock:
             if session_id not in self.sessions:
                 self.sessions[session_id] = SessionState(
-                    session_id, text, purposes, memory_window, agent_server_url
+                    session_id, text, purposes, memory_window, agent_server_url, consumer_type
                 )
                 return True
             return False
@@ -283,7 +293,10 @@ class MQTTStreamManager:
     # Forwarding — to agent-manager 
     # ------------------------------------------------------------------
     async def _forward(self, state: SessionState, data: dict):
-        await self._forward_to_agent(state, data)
+        if state.consumer_type == "browser":
+            await self._forward_ws(state, data)
+        else:
+            await self._forward_to_agent(state, data)
 
     async def _forward_to_agent(self, state: SessionState, data: dict):
         url = state.agent_server_url
@@ -319,7 +332,16 @@ class MQTTStreamManager:
                     logger.info(f"Datapoint forwarded to agent {state.agent_id}")
             except Exception as e:
                 logger.error(f"Datapoint forward failed for agent {state.agent_id}: {e}")
-
+    
+    async def _forward_ws(self, state: SessionState, data: dict):
+        async with state.ws_lock:
+            dead = set()
+            for ws in list(state.websockets):
+                try:
+                    await ws.send_json(data)
+                except Exception:
+                    dead.add(ws)
+            state.websockets -= dead
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -359,6 +381,20 @@ async def subscribe(req: SubscribeRequest):
     result = await manager.subscribe(req.session_id, req.topic)
     return {"session_id": req.session_id, "result": result}
 
+@app.post("/subscribe_browser")
+async def subscribe_browser(req: BrowserSubscribeRequest):
+    manager: MQTTStreamManager = app.state.manager
+    await manager.register_session(
+        session_id=req.session_id,
+        text="",
+        purposes=req.purposes,
+        memory_window=0,
+        agent_server_url=agent_server_url,
+        consumer_type="browser",
+    )
+    result = await manager.subscribe(req.session_id, req.topic)
+    return {"session_id": req.session_id, "result": result}
+
 @app.post("/unsubscribe")
 async def unsubscribe(req: UnsubscribeRequest):
     manager: MQTTStreamManager = app.state.manager
@@ -370,6 +406,42 @@ async def cleanup(session_id: str):
     manager: MQTTStreamManager = app.state.manager
     await manager.cleanup_session(session_id)
     return {"session_id": session_id, "result": "cleaned up"}
+
+
+# ---------------------------------------------------------------------------
+# WebSocket endpoint 
+# ---------------------------------------------------------------------------
+@app.websocket("/ws/{session_id}")
+async def websocket_endpoint(websocket: WebSocket, session_id: str):
+    manager: MQTTStreamManager = app.state.manager
+    await websocket.accept()
+
+    async with manager.state_lock:
+        state = manager.sessions.get(session_id)
+    if not state or state.consumer_type != "browser":
+        await websocket.close(code=4004)
+        return
+
+    async with state.ws_lock:
+        state.websockets.add(websocket)
+    logger.info(f"Browser WebSocket connected for session {session_id}")
+
+    try:
+        while True:
+            try:
+                await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
+            except asyncio.TimeoutError:
+                try:
+                    await websocket.send_json({"type": "ping"})
+                except Exception:
+                    break
+    except (WebSocketDisconnect, Exception):
+        pass
+    finally:
+        async with state.ws_lock:
+            state.websockets.discard(websocket)
+        await manager.cleanup_session(session_id)
+        logger.info(f"Browser WebSocket disconnected for session {session_id}")
 
 # ---------------------------------------------------------------------------
 # Subscription info endpoints
