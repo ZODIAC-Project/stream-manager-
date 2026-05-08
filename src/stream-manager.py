@@ -44,10 +44,8 @@ else:
 # ---------------------------------------------------------------------------
 class SubscribeRequest(BaseModel):
     session_id: str # Session of the user that request subscription
-    topic: str # MQTT topic to subscribe to
-    text: str # Text that is used as instruction for the agent                         
+    topic: str # MQTT topic to subscribe to                     
     purposes: list[str] = [] # PBAC purposes 
-    memory_window: int = 5 
     agent_server_url: Optional[str] = None  # overrides AGENT_SERVER_URL env var
     
 class BrowserSubscribeRequest(BaseModel):
@@ -68,17 +66,13 @@ class UnsubscribeRequest(BaseModel):
 #   - agent_id returned by /agents after first message triggers creation
 # ---------------------------------------------------------------------------
 class SessionState:
-    def __init__(self, session_id: str, text: str, purposes: list,
-                 memory_window: int, agent_server_url: str, consumer_type: str = "agent"):
+    def __init__(self, session_id: str, purposes: list,
+                 agent_server_url: str, consumer_type: str = "agent"):
         self.session_id             = session_id
         self.topics: Set[str]       = set()
-        self.text                   = text
         self.purposes               = purposes
-        self.memory_window          = memory_window
         self.consumer_type          = consumer_type
         self.agent_server_url       = agent_server_url
-        self.agent_id: Optional[str] = None  # set after /agents responds on first message
-        # browser options
         self.websockets: Set[WebSocket] = set()
         self.ws_lock = asyncio.Lock()
         
@@ -121,16 +115,17 @@ class MQTTStreamManager:
     # ------------------------------------------------------------------
     # Public API called by HTTP endpoints
     # ------------------------------------------------------------------
-    async def register_session(self, session_id: str, text: str, purposes: list,
-                                memory_window: int, agent_server_url: str,
+    async def register_session(self, session_id: str, purposes: list,
+                                agent_server_url: str,
                                 consumer_type: str = "agent") -> bool:
         async with self.state_lock:
             if session_id not in self.sessions:
                 self.sessions[session_id] = SessionState(
-                    session_id, text, purposes, memory_window, agent_server_url, consumer_type
+                    session_id, purposes, agent_server_url, consumer_type
                 )
                 return True
             return False
+
 
     async def subscribe(self, session_id: str, topic: str) -> str:
         async with self.state_lock:
@@ -180,24 +175,12 @@ class MQTTStreamManager:
             state = self.sessions.pop(session_id, None)
             if not state:
                 return
-
             for topic in list(state.topics):
                 if topic in self.topic_sessions:
                     self.topic_sessions[topic].discard(session_id)
                     if not self.topic_sessions[topic]:
                         del self.topic_sessions[topic]
                         await self._pending_subscribes.put(("unsubscribe", topic))
-
-        # Notify agent-manager to stop the agent (delete endpoint )
-        if state.agent_id:
-            url = f"{state.agent_server_url}/{state.agent_id}"
-            try:
-                async with httpx.AsyncClient(timeout=5.0) as client:
-                    await client.delete(url)
-                    logger.info(f"Agent {state.agent_id} deleted for session {session_id}")
-            except Exception as e:
-                logger.error(f"Failed to delete agent {state.agent_id}: {e}")
-
         logger.info(f"Session {session_id} cleaned up.")
 
     async def get_all_subscriptions(self) -> dict:
@@ -300,39 +283,16 @@ class MQTTStreamManager:
             await self._forward_to_agent(state, data)
 
     async def _forward_to_agent(self, state: SessionState, data: dict):
-        url = state.agent_server_url
-
-        if state.agent_id is None:
-            # Agent not created yet — create it now on first incoming message
-            combined_text = f"{state.text}\n\nData: {data['payload']}"
-            create_payload = {
-                "intervalMs":   0,
-                "runOnce":      True,
-                "text":         combined_text,
-                "purposes":     state.purposes,
-                "memoryWindow": state.memory_window,
-            }
-            try:
-                async with httpx.AsyncClient(timeout=5.0) as client:
-                    resp = await client.post(url, json=create_payload)
-                    resp.raise_for_status()
-                    state.agent_id = resp.json()["id"]
-                    logger.info(f"Agent {state.agent_id} created for session {state.session_id}")
-            except Exception as e:
-                logger.error(f"Agent creation failed for session {state.session_id}: {e}. Cleaning up.")
-                await self.cleanup_session(state.session_id)
-        else:
-            # Agent already running — forward the new datapoint
-            try:
-                async with httpx.AsyncClient(timeout=5.0) as client:
-                    resp = await client.post(
-                        f"{url}/{state.agent_id}",
-                        json={"datapoint": data["payload"]}
-                    )
-                    resp.raise_for_status()
-                    logger.info(f"Datapoint forwarded to agent {state.agent_id}")
-            except Exception as e:
-                logger.error(f"Datapoint forward failed for agent {state.agent_id}: {e}")
+        url = f"{state.agent_server_url}/{state.session_id}"
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.post(url, json={"datapoint": data["payload"],
+                                                    "topic":     data["topic"],
+                                                    "timestamp": data["timestamp"]})
+                resp.raise_for_status()
+                logger.info(f"Forwarded to {url}")
+        except Exception as e:
+            logger.error(f"Forward failed for session {state.session_id}: {e}")
     
     async def _forward_ws(self, state: SessionState, data: dict):
         async with state.ws_lock:
@@ -369,14 +329,10 @@ app.add_middleware(
 @app.post("/subscribe")
 async def subscribe(req: SubscribeRequest):
     manager: MQTTStreamManager = app.state.manager
-
     url = req.agent_server_url or agent_server_url
-
     await manager.register_session(
         session_id=req.session_id,
-        text=req.text,
         purposes=req.purposes,
-        memory_window=req.memory_window,
         agent_server_url=url,
     )
     result = await manager.subscribe(req.session_id, req.topic)
