@@ -343,9 +343,7 @@ async def subscribe_browser(req: BrowserSubscribeRequest):
     manager: MQTTStreamManager = app.state.manager
     await manager.register_session(
         session_id=req.session_id,
-        text="",
         purposes=req.purposes,
-        memory_window=0,
         agent_server_url=agent_server_url,
         consumer_type="browser",
     )
