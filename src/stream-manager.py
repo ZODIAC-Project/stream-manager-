@@ -63,7 +63,6 @@ class UnsubscribeRequest(BaseModel):
 # Tracks for each session_id:
 #   - which topics are subscribed
 #   - agent config (text, purposes, memory_window, agent_server_url)
-#   - agent_id returned by /agents after first message triggers creation
 # ---------------------------------------------------------------------------
 class SessionState:
     def __init__(self, session_id: str, purposes: list,
@@ -189,7 +188,6 @@ class MQTTStreamManager:
                 "sessions": [
                     {
                         "session_id": state.session_id,
-                        "agent_id":   state.agent_id,
                         "topics":     sorted(state.topics),
                     }
                     for state in self.sessions.values()
@@ -207,7 +205,6 @@ class MQTTStreamManager:
                 return None
             return {
                 "session_id": state.session_id,
-                "agent_id":   state.agent_id,
                 "topics":     sorted(state.topics),
             }
 
@@ -361,11 +358,6 @@ async def cleanup(session_id: str):
     manager: MQTTStreamManager = app.state.manager
     await manager.cleanup_session(session_id)
     return {"session_id": session_id, "result": "cleaned up"}
-
-@app.get("/list_subscriptions")
-async def list_subscriptions():
-    manager: MQTTStreamManager = app.state.manager
-    return await manager.list_sessions()
 
 # ---------------------------------------------------------------------------
 # WebSocket endpoint 
