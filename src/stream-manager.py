@@ -362,6 +362,10 @@ async def cleanup(session_id: str):
     await manager.cleanup_session(session_id)
     return {"session_id": session_id, "result": "cleaned up"}
 
+@app.get("/list_subscriptions")
+async def list_subscriptions():
+    manager: MQTTStreamManager = app.state.manager
+    return await manager.list_sessions()
 
 # ---------------------------------------------------------------------------
 # WebSocket endpoint 
