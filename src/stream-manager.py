@@ -182,6 +182,43 @@ class MQTTStreamManager:
                         await self._pending_subscribes.put(("unsubscribe", topic))
         logger.info(f"Session {session_id} cleaned up.")
 
+    async def clear_all(self) -> dict:
+        """Remove all sessions and topics and close any browser websockets.
+
+        This enqueues unsubscribe actions for all currently tracked topics so
+        the shared MQTT client will unsubscribe from the broker.
+        """
+        # Snapshot current sessions/topics and clear under lock
+        async with self.state_lock:
+            sessions_copy = list(self.sessions.values())
+            topics_copy = list(self.topic_sessions.keys())
+            num_sessions = len(self.sessions)
+            num_topics = len(self.topic_sessions)
+
+            # Clear internal maps so new activity can start fresh
+            self.sessions.clear()
+            self.topic_sessions.clear()
+
+            # Enqueue unsubscribe for all topics so the MQTT client will drop them
+            for topic in topics_copy:
+                await self._pending_subscribes.put(("unsubscribe", topic))
+
+        # Close any browser websockets outside of state_lock to avoid deadlocks
+        for state in sessions_copy:
+            try:
+                async with state.ws_lock:
+                    for ws in list(state.websockets):
+                        try:
+                            await ws.close()
+                        except Exception:
+                            pass
+            except Exception:
+                # defensive: if state has no ws_lock or websockets, ignore
+                pass
+
+        logger.info(f"Cleared {num_sessions} sessions and {num_topics} topics.")
+        return {"result": "cleared", "sessions_removed": num_sessions, "topics_removed": num_topics}
+
     async def get_all_subscriptions(self) -> dict:
         async with self.state_lock:
             return {
@@ -358,6 +395,12 @@ async def cleanup(session_id: str):
     manager: MQTTStreamManager = app.state.manager
     await manager.cleanup_session(session_id)
     return {"session_id": session_id, "result": "cleaned up"}
+
+
+@app.post("/clear_all")
+async def clear_all():
+    manager: MQTTStreamManager = app.state.manager
+    return await manager.clear_all()
 
 # ---------------------------------------------------------------------------
 # WebSocket endpoint 
