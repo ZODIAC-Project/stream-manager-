@@ -1,20 +1,22 @@
 import os
-import json
 import asyncio
 import datetime
-import aiomqtt
 import httpx
 import logging
+
+import paho.mqtt.client as mqtt
+from paho.mqtt.enums import CallbackAPIVersion
 
 from typing import Dict, Set, Optional
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
+from purpose_subscribe_client import PurposeSubscribeClient
 
 import uvicorn
 from starlette.websockets import WebSocket as StarletteWS
@@ -31,123 +33,206 @@ logger = logging.getLogger('stream-service')
 # Config
 # ---------------------------------------------------------------------------
 mqtt_broker            = os.getenv('MQTT_BROKER')
+mqtt_port              = int(os.getenv('MQTT_PORT', '1883'))
+mqtt_presub            = os.getenv('MQTT_PRESUB', 'false').lower() == 'true'
 agent_server_url       = os.getenv('AGENT_SERVER_URL', 'http://localhost:8000/agents').rstrip('/')
 max_topics_per_session = int(os.getenv('MAX_TOPICS_PER_SESSION', '20'))
 
 if mqtt_broker is None:
     logger.warning("MQTT_BROKER env var not set. Subscriptions will fail.")
 else:
-    logger.info(f"MQTT_BROKER set to {mqtt_broker}")
+    logger.info(f"MQTT_BROKER={mqtt_broker}:{mqtt_port}  presub={mqtt_presub}")
 
 # ---------------------------------------------------------------------------
 # Data models
 # ---------------------------------------------------------------------------
 class SubscribeRequest(BaseModel):
-    session_id: str # Session of the user that request subscription
-    topic: str # MQTT topic to subscribe to                     
-    purposes: list[str] = [] # PBAC purposes 
+    session_id: str
+    topic: str
+    purpose: str                           
     agent_server_url: Optional[str] = None  # overrides AGENT_SERVER_URL env var
-    
+
 class BrowserSubscribeRequest(BaseModel):
     session_id: str
     topic: str
-    purposes: list[str] = []
+    purpose: str                          
 
 class UnsubscribeRequest(BaseModel):
     session_id: str
     topic: str
-    
+
 
 # ---------------------------------------------------------------------------
-# Session state
-# Tracks for each session_id:
-#   - which topics are subscribed
-#   - agent config (text, purposes, memory_window, agent_server_url)
+# Topic subscription record
+# ---------------------------------------------------------------------------
+class TopicSubscription:
+    """Tracks a single topic+purpose pair for a session."""
+    def __init__(self, topic: str, purpose: str):
+        self.topic   = topic
+        self.purpose = purpose
+
+
+# ---------------------------------------------------------------------------
+# Session state — with paho client connection
 # ---------------------------------------------------------------------------
 class SessionState:
-    def __init__(self, session_id: str, purposes: list,
-                 agent_server_url: str, consumer_type: str = "agent"):
-        self.session_id             = session_id
-        self.topics: Set[str]       = set()
-        self.purposes               = purposes
-        self.consumer_type          = consumer_type
-        self.agent_server_url       = agent_server_url
+    def __init__(self, session_id: str, agent_server_url: str,
+                 consumer_type: str, event_loop: asyncio.AbstractEventLoop,
+                 broker_url: str, port: int, presub: bool,
+                 manager: "MQTTStreamManager"):
+        self.session_id    = session_id
+        self.consumer_type = consumer_type
+        self.agent_server_url = agent_server_url
+        self.presub        = presub
+
+        self.subscriptions: Dict[str, TopicSubscription] = {}
+
         self.websockets: Set[WebSocket] = set()
         self.ws_lock = asyncio.Lock()
-        
+
+        self._event_loop = event_loop
+        self._manager    = manager  
+
+        # Per-session paho client
+        paho_client = mqtt.Client(
+            callback_api_version=CallbackAPIVersion.VERSION2,
+            client_id=f"stream-service-{session_id}",
+            clean_session=True,
+        )
+        self._purpose_client = PurposeSubscribeClient(
+            paho_client,
+            log_problems=True,
+            purpose_aware=True,
+            presub=presub,
+        )
+        self._paho = paho_client
+
+        self._paho.on_connect    = self._on_connect
+        self._paho.on_message    = self._on_message
+        self._paho.on_disconnect = self._on_disconnect
+
+        self._paho.connect(broker_url, port, keepalive=60)
+        self._paho.loop_start()
+        logger.info(f"Session {session_id}: paho client started.")
+
+    # ------------------------------------------------------------------
+    # Paho callbacks — run on paho's background thread
+    # ------------------------------------------------------------------
+    def _on_connect(self, client, userdata, flags, rc, properties=None):
+        logger.info(f"Session {self.session_id}: MQTT connected (rc={rc}). Re-subscribing.")
+        for sub in list(self.subscriptions.values()):
+            self._do_subscribe(sub.topic, sub.purpose)
+
+    def _on_disconnect(self, client, userdata, rc, properties=None):
+        logger.warning(f"Session {self.session_id}: MQTT disconnected (rc={rc}).")
+
+    def _on_message(self, client, userdata, msg):
+        """Bridge incoming message from paho thread to asyncio event loop."""
+        topic   = str(msg.topic)
+        payload = msg.payload.decode(errors="replace")
+        data    = {
+            "type":      "mqtt_data",
+            "topic":     topic,
+            "payload":   payload,
+            "timestamp": datetime.datetime.now().isoformat(),
+        }
+        asyncio.run_coroutine_threadsafe(
+            self._manager._forward(self, data),
+            self._event_loop,
+        )
+
+    # ------------------------------------------------------------------
+    # Broker operations (called from any thread — paho is thread-safe)
+    # ------------------------------------------------------------------
+    def _do_subscribe(self, topic: str, purpose: str):
+        try:
+            self._purpose_client.subscribe_with_purpose(
+                topic=topic,
+                ap=purpose,
+                qos=0,
+                presub=self.presub,
+            )
+            logger.info(f"Session {self.session_id}: broker subscribe topic={topic} purpose={purpose}")
+        except Exception as e:
+            logger.error(f"Session {self.session_id}: broker subscribe failed for {topic}: {e}")
+
+    def _do_unsubscribe(self, topic: str):
+        try:
+            self._paho.unsubscribe(topic)
+            logger.info(f"Session {self.session_id}: broker unsubscribe topic={topic}")
+        except Exception as e:
+            logger.error(f"Session {self.session_id}: broker unsubscribe failed for {topic}: {e}")
+
+    def stop(self):
+        self._paho.loop_stop()
+        self._paho.disconnect()
+        logger.info(f"Session {self.session_id}: paho client stopped.")
+
 
 # ---------------------------------------------------------------------------
-# Shared MQTT Manager
-# One persistent MQTT connection for the whole service.
-# Routes incoming messages to the correct session by topic.
+# MQTT Stream Manager
+# Owns sessions; each session has its own paho connection.
 # ---------------------------------------------------------------------------
 class MQTTStreamManager:
-    def __init__(self, broker_url: str):
+    def __init__(self, broker_url: str, port: int, presub: bool):
         self.broker_url = broker_url
+        self.port       = port
+        self.presub     = presub
 
         # session_id -> SessionState
         self.sessions: Dict[str, SessionState] = {}
-        # topic -> set of session_ids  (many sessions can share a topic)
-        self.topic_sessions: Dict[str, Set[str]] = {}
-
         self.state_lock = asyncio.Lock()
-        self._listener_task: Optional[asyncio.Task] = None
-        self._mqtt_client: Optional[aiomqtt.Client] = None
-        self._pending_subscribes: asyncio.Queue = asyncio.Queue()
+        self._event_loop: Optional[asyncio.AbstractEventLoop] = None
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
-    async def start(self):
-        self._listener_task = asyncio.create_task(self._shared_listener())
-        logger.info("Shared MQTT listener started.")
+    def start(self, event_loop: asyncio.AbstractEventLoop):
+        self._event_loop = event_loop
+        logger.info("MQTTStreamManager started.")
 
-    async def stop(self):
-        if self._listener_task:
-            self._listener_task.cancel()
-            try:
-                await self._listener_task
-            except asyncio.CancelledError:
-                pass
-        logger.info("Shared MQTT listener stopped.")
+    def stop(self):
+        for state in list(self.sessions.values()):
+            state.stop()
+        logger.info("MQTTStreamManager stopped.")
 
     # ------------------------------------------------------------------
-    # Public API called by HTTP endpoints
+    # Public API
     # ------------------------------------------------------------------
-    async def register_session(self, session_id: str, purposes: list,
-                                agent_server_url: str,
+    async def register_session(self, session_id: str, agent_server_url: str,
                                 consumer_type: str = "agent") -> bool:
         async with self.state_lock:
             if session_id not in self.sessions:
                 self.sessions[session_id] = SessionState(
-                    session_id, purposes, agent_server_url, consumer_type
+                    session_id=session_id,
+                    agent_server_url=agent_server_url,
+                    consumer_type=consumer_type,
+                    event_loop=self._event_loop,
+                    broker_url=self.broker_url,
+                    port=self.port,
+                    presub=self.presub,
+                    manager=self,
                 )
                 return True
             return False
 
-
-    async def subscribe(self, session_id: str, topic: str) -> str:
+    async def subscribe(self, session_id: str, topic: str, purpose: str) -> str:
         async with self.state_lock:
             if session_id not in self.sessions:
                 return "Session not registered."
 
             state = self.sessions[session_id]
-            if len(state.topics) >= max_topics_per_session:
+            if len(state.subscriptions) >= max_topics_per_session:
                 return f"Subscription limit reached ({max_topics_per_session} topics max)."
-            if topic in state.topics:
+            if topic in state.subscriptions:
                 return f"Already subscribed to {topic}."
 
-            state.topics.add(topic)
+            state.subscriptions[topic] = TopicSubscription(topic, purpose)
 
-            if topic not in self.topic_sessions:
-                self.topic_sessions[topic] = set()
-                # Tell the listener to subscribe on the broker
-                await self._pending_subscribes.put(("subscribe", topic))
+        state._do_subscribe(topic, purpose)
 
-            self.topic_sessions[topic].add(session_id)
-
-        logger.info(f"Session {session_id} subscribed to {topic}")
-        return f"Subscribed to {topic}. Data streaming."
+        logger.info(f"Session {session_id} subscribed to {topic} (purpose={purpose})")
+        return f"Subscribed to {topic} with purpose '{purpose}'. Data streaming."
 
     async def unsubscribe(self, session_id: str, topic: str) -> str:
         async with self.state_lock:
@@ -155,16 +240,12 @@ class MQTTStreamManager:
                 return "Session not registered."
 
             state = self.sessions[session_id]
-            if topic not in state.topics:
+            if topic not in state.subscriptions:
                 return "No active subscription found."
 
-            state.topics.discard(topic)
+            del state.subscriptions[topic]
 
-            if topic in self.topic_sessions:
-                self.topic_sessions[topic].discard(session_id)
-                if not self.topic_sessions[topic]:
-                    del self.topic_sessions[topic]
-                    await self._pending_subscribes.put(("unsubscribe", topic))
+        state._do_unsubscribe(topic)
 
         logger.info(f"Session {session_id} unsubscribed from {topic}")
         return f"Unsubscribed from {topic}."
@@ -172,39 +253,19 @@ class MQTTStreamManager:
     async def cleanup_session(self, session_id: str):
         async with self.state_lock:
             state = self.sessions.pop(session_id, None)
-            if not state:
-                return
-            for topic in list(state.topics):
-                if topic in self.topic_sessions:
-                    self.topic_sessions[topic].discard(session_id)
-                    if not self.topic_sessions[topic]:
-                        del self.topic_sessions[topic]
-                        await self._pending_subscribes.put(("unsubscribe", topic))
+        if not state:
+            return
+        state.stop()
         logger.info(f"Session {session_id} cleaned up.")
 
     async def clear_all(self) -> dict:
-        """Remove all sessions and topics and close any browser websockets.
-
-        This enqueues unsubscribe actions for all currently tracked topics so
-        the shared MQTT client will unsubscribe from the broker.
-        """
-        # Snapshot current sessions/topics and clear under lock
         async with self.state_lock:
             sessions_copy = list(self.sessions.values())
-            topics_copy = list(self.topic_sessions.keys())
-            num_sessions = len(self.sessions)
-            num_topics = len(self.topic_sessions)
-
-            # Clear internal maps so new activity can start fresh
+            num_sessions  = len(self.sessions)
             self.sessions.clear()
-            self.topic_sessions.clear()
 
-            # Enqueue unsubscribe for all topics so the MQTT client will drop them
-            for topic in topics_copy:
-                await self._pending_subscribes.put(("unsubscribe", topic))
-
-        # Close any browser websockets outside of state_lock to avoid deadlocks
         for state in sessions_copy:
+            state.stop()
             try:
                 async with state.ws_lock:
                     for ws in list(state.websockets):
@@ -213,26 +274,24 @@ class MQTTStreamManager:
                         except Exception:
                             pass
             except Exception:
-                # defensive: if state has no ws_lock or websockets, ignore
                 pass
 
-        logger.info(f"Cleared {num_sessions} sessions and {num_topics} topics.")
-        return {"result": "cleared", "sessions_removed": num_sessions, "topics_removed": num_topics}
+        logger.info(f"Cleared {num_sessions} sessions.")
+        return {"result": "cleared", "sessions_removed": num_sessions}
 
     async def get_all_subscriptions(self) -> dict:
         async with self.state_lock:
             return {
                 "sessions": [
                     {
-                        "session_id": state.session_id,
-                        "topics":     sorted(state.topics),
+                        "session_id":    state.session_id,
+                        "subscriptions": [
+                            {"topic": sub.topic, "purpose": sub.purpose}
+                            for sub in state.subscriptions.values()
+                        ],
                     }
                     for state in self.sessions.values()
                 ],
-                "topics": {
-                    topic: sorted(list(session_ids))
-                    for topic, session_ids in self.topic_sessions.items()
-                }
             }
 
     async def get_session_subscriptions(self, session_id: str) -> Optional[dict]:
@@ -241,74 +300,15 @@ class MQTTStreamManager:
             if not state:
                 return None
             return {
-                "session_id": state.session_id,
-                "topics":     sorted(state.topics),
+                "session_id":    state.session_id,
+                "subscriptions": [
+                    {"topic": sub.topic, "purpose": sub.purpose}
+                    for sub in state.subscriptions.values()
+                ],
             }
 
     # ------------------------------------------------------------------
-    # Shared MQTT listener — one connection for all topics
-    # ------------------------------------------------------------------
-    async def _shared_listener(self):
-        while True:
-            try:
-                async with aiomqtt.Client(self.broker_url) as client:
-                    self._mqtt_client = client
-
-                    # Re-subscribe to all currently active topics after reconnect
-                    async with self.state_lock:
-                        active_topics = list(self.topic_sessions.keys())
-                    for topic in active_topics:
-                        await client.subscribe(topic)
-                        logger.info(f"(Re)subscribed to broker topic: {topic}")
-
-                    # Process incoming messages and pending subscribe/unsubscribe requests
-                    async with asyncio.TaskGroup() as tg:
-                        tg.create_task(self._message_loop(client))
-                        tg.create_task(self._pending_loop(client))
-
-            except* asyncio.CancelledError:
-                raise asyncio.CancelledError()
-            except* Exception as eg:
-                for e in eg.exceptions:
-                    logger.error(f"MQTT connection error: {e}. Reconnecting in 5s...")
-                self._mqtt_client = None
-                await asyncio.sleep(5)
-
-    async def _message_loop(self, client: aiomqtt.Client):
-        async for message in client.messages:
-            topic   = str(message.topic)
-            payload = message.payload.decode()
-            data    = {
-                "type":      "mqtt_data",
-                "topic":     topic,
-                "payload":   payload,
-                "timestamp": datetime.datetime.now().isoformat()
-            }
-            async with self.state_lock:
-                session_ids = list(self.topic_sessions.get(topic, set()))
-
-            for session_id in session_ids:
-                async with self.state_lock:
-                    state = self.sessions.get(session_id)
-                if state:
-                    await self._forward(state, data)
-
-    async def _pending_loop(self, client: aiomqtt.Client):
-        """Apply pending subscribe/unsubscribe requests to the live MQTT client."""
-        while True:
-            action, topic = await self._pending_subscribes.get()
-            try:
-                if action == "subscribe":
-                    await client.subscribe(topic)
-                    logger.info(f"MQTT subscribed: {topic}")
-                elif action == "unsubscribe":
-                    await client.unsubscribe(topic)
-                    logger.info(f"MQTT unsubscribed: {topic}")
-            except Exception as e:
-                logger.error(f"Failed to {action} {topic}: {e}")
-
-    # ------------------------------------------------------------------
-    # Forwarding — to agent-manager 
+    # Forwarding — unchanged from before
     # ------------------------------------------------------------------
     async def _forward(self, state: SessionState, data: dict):
         if state.consumer_type == "browser":
@@ -317,17 +317,19 @@ class MQTTStreamManager:
             await self._forward_to_agent(state, data)
 
     async def _forward_to_agent(self, state: SessionState, data: dict):
-        url = f"{state.agent_server_url}/agents/{state.session_id}"
+        url = f"{state.agent_server_url}/{state.session_id}"
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.post(url, json={"datapoint": data["payload"],
-                                                    "topic":     data["topic"],
-                                                    "timestamp": data["timestamp"]})
+                resp = await client.post(url, json={
+                    "datapoint": data["payload"],
+                    "topic":     data["topic"],
+                    "timestamp": data["timestamp"],
+                })
                 resp.raise_for_status()
                 logger.info(f"Forwarded to {url}")
         except Exception as e:
             logger.error(f"Forward failed for session {state.session_id}: {e}")
-    
+
     async def _forward_ws(self, state: SessionState, data: dict):
         async with state.ws_lock:
             dead = set()
@@ -338,27 +340,33 @@ class MQTTStreamManager:
                     dead.add(ws)
             state.websockets -= dead
 
+
 # ---------------------------------------------------------------------------
 # App setup
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    manager = MQTTStreamManager(mqtt_broker)
+    manager = MQTTStreamManager(
+        broker_url=mqtt_broker,
+        port=mqtt_port,
+        presub=mqtt_presub,
+    )
     app.state.manager = manager
-    await manager.start()
+    manager.start(asyncio.get_event_loop())
     yield
-    await manager.stop()
+    manager.stop()
 
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
-    allow_headers=["*"]
+    allow_headers=["*"],
 )
 
+
 # ---------------------------------------------------------------------------
-# HTTP endpoints
+# HTTP endpoints 
 # ---------------------------------------------------------------------------
 @app.post("/subscribe")
 async def subscribe(req: SubscribeRequest):
@@ -366,29 +374,30 @@ async def subscribe(req: SubscribeRequest):
     url = req.agent_server_url or agent_server_url
     await manager.register_session(
         session_id=req.session_id,
-        purposes=req.purposes,
         agent_server_url=url,
     )
-    result = await manager.subscribe(req.session_id, req.topic)
+    result = await manager.subscribe(req.session_id, req.topic, req.purpose)
     return {"session_id": req.session_id, "result": result}
+
 
 @app.post("/subscribe_browser")
 async def subscribe_browser(req: BrowserSubscribeRequest):
     manager: MQTTStreamManager = app.state.manager
     await manager.register_session(
         session_id=req.session_id,
-        purposes=req.purposes,
         agent_server_url=agent_server_url,
         consumer_type="browser",
     )
-    result = await manager.subscribe(req.session_id, req.topic)
+    result = await manager.subscribe(req.session_id, req.topic, req.purpose)
     return {"session_id": req.session_id, "result": result}
+
 
 @app.post("/unsubscribe")
 async def unsubscribe(req: UnsubscribeRequest):
     manager: MQTTStreamManager = app.state.manager
     result = await manager.unsubscribe(req.session_id, req.topic)
     return {"session_id": req.session_id, "result": result}
+
 
 @app.post("/cleanup/{session_id}")
 async def cleanup(session_id: str):
@@ -402,8 +411,9 @@ async def clear_all():
     manager: MQTTStreamManager = app.state.manager
     return await manager.clear_all()
 
+
 # ---------------------------------------------------------------------------
-# WebSocket endpoint 
+# WebSocket endpoint
 # ---------------------------------------------------------------------------
 @app.websocket("/ws/{session_id}")
 async def websocket_endpoint(websocket: WebSocket, session_id: str):
@@ -437,13 +447,15 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
         await manager.cleanup_session(session_id)
         logger.info(f"Browser WebSocket disconnected for session {session_id}")
 
+
 # ---------------------------------------------------------------------------
-# Subscription info endpoints
+# Subscription info endpoints 
 # ---------------------------------------------------------------------------
 @app.get("/subscriptions")
 async def list_subscriptions():
     manager: MQTTStreamManager = app.state.manager
     return await manager.get_all_subscriptions()
+
 
 @app.get("/subscriptions/{session_id}")
 async def get_session_subscriptions(session_id: str):
@@ -453,12 +465,14 @@ async def get_session_subscriptions(session_id: str):
         return JSONResponse(status_code=404, content={"error": "Session not found"})
     return result
 
+
 # ---------------------------------------------------------------------------
 # Health
 # ---------------------------------------------------------------------------
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8002")))
