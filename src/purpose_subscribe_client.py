@@ -1,9 +1,6 @@
 import logging
 import time
 
-from otel_setup import get_tracer
-
-
 class PurposeSubscribeClient:
     """
     Minimal purpose-aware MQTT subscriber wrapper.
