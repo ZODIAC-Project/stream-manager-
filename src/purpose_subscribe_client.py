@@ -15,7 +15,6 @@ class PurposeSubscribeClient:
 
     def __init__(self, client, log_problems=True, purpose_aware=False, qos=0, presub=False) -> None:
         self.client = client
-        self.tracer = get_tracer(__name__)
         self.logger = logging.getLogger(__name__)
         self.purpose_aware = purpose_aware
         self.presub = presub
@@ -55,17 +54,10 @@ class PurposeSubscribeClient:
             self.logger.warning("subscription wait timer timed out!")
 
     def subscribe(self, topic, qos=1):
-        with self.tracer.start_as_current_span("mqtt.client.subscribe") as span:
-            span.set_attribute("messaging.system", "mqtt")
-            span.set_attribute("messaging.operation", "subscribe")
-            span.set_attribute("messaging.destination.name", topic)
-            span.set_attribute("messaging.mqtt.qos", qos)
-            (success, mid) = self.client.subscribe(topic, qos=qos)
-            span.set_attribute("messaging.message.id", mid)
-            span.set_attribute("mqtt.subscribe.result_code", success)
-            self.logger.debug("subscribed with mid %s, success: %s", mid, success)
-            if qos > 0:
-                self.subscriptions_pending.append(mid)
+        (success, mid) = self.client.subscribe(topic, qos=qos)
+        self.logger.debug("subscribed with mid %s, success: %s", mid, success)
+        if qos > 0:
+            self.subscriptions_pending.append(mid)
 
     @staticmethod
     def escape_topic(topic):
@@ -83,29 +75,16 @@ class PurposeSubscribeClient:
             return self.subscribe(purpose_topic, qos=qos)
 
     def on_connect(self, client, userdata, flags, rc, properties=None):
-        with self.tracer.start_as_current_span("mqtt.on_connect") as span:
-            span.set_attribute("messaging.system", "mqtt")
-            span.set_attribute("mqtt.result_code", rc)
-            try:
-                self.logger.debug("Connected with result code %s properties=%s", rc, getattr(properties, "__dict__", properties))
-            except Exception:
-                self.logger.debug("Connected with result code %s", rc)
+        try:
+            self.logger.debug("Connected with result code %s properties=%s", rc, getattr(properties, "__dict__", properties))
+        except Exception:
+            self.logger.debug("Connected with result code %s", rc)
 
     def on_message(self, client, userdata, msg):
-        with self.tracer.start_as_current_span("mqtt.on_message") as span:
-            span.set_attribute("messaging.system", "mqtt")
-            span.set_attribute("messaging.operation", "receive")
-            span.set_attribute("messaging.destination.name", msg.topic)
-            span.set_attribute("messaging.message.body.size", len(msg.payload))
-            span.set_attribute("messaging.mqtt.qos", msg.qos)
-            span.set_attribute("messaging.mqtt.retained", msg.retain)
-            self.logger.debug("received message on %s", msg.topic)
+        self.logger.debug("received message on %s", msg.topic)
 
     def on_disconnect(self, client, userdata, rc, properties=None):
-        with self.tracer.start_as_current_span("mqtt.on_disconnect") as span:
-            span.set_attribute("messaging.system", "mqtt")
-            span.set_attribute("mqtt.result_code", rc)
-            try:
-                self.logger.critical("disconnect! rc=%s properties=%s", rc, getattr(properties, "__dict__", properties))
-            except Exception:
-                self.logger.critical("disconnect! (failed to format properties)")
+        try:
+            self.logger.critical("disconnect! rc=%s properties=%s", rc, getattr(properties, "__dict__", properties))
+        except Exception:
+            self.logger.critical("disconnect! (failed to format properties)")
