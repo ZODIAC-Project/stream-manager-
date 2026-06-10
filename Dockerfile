@@ -11,7 +11,7 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-install-project --no-dev
 
 # Copy application code
-COPY src/stream-manager.py .
+COPY src/ .
 
 # Use uv's managed venv to run the app
 ENV PATH="/app/.venv/bin:$PATH"
