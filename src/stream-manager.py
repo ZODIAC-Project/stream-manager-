@@ -323,7 +323,7 @@ class MQTTStreamManager:
             await self._forward_to_agent(state, data)
 
     async def _forward_to_agent(self, state: SessionState, data: dict):
-        url = f"{state.agent_server_url}/{state.session_id}"
+        url = f"{state.agent_server_url}/agents/{state.session_id}"
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
                 resp = await client.post(url, json={
