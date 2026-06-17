@@ -110,21 +110,20 @@ class SessionState:
         self._paho.on_connect    = self._on_connect
         self._paho.on_message    = self._on_message
         self._paho.on_disconnect = self._on_disconnect
+        
+        self._connected_once = False
 
         self._paho.connect(broker_url, port, keepalive=60)
         self._paho.loop_start()
         logger.info(f"Session {session_id}: paho client started.")
-        
-        self._connected_once = False
 
     # ------------------------------------------------------------------
     # Paho callbacks — run on paho's background thread
     # ------------------------------------------------------------------
     def _on_connect(self, client, userdata, flags, rc, properties=None):
-        logger.info(f"Session {self.session_id}: MQTT connected (rc={rc}).")
-        if self._connected_once:
-            # Reconnect — re-subscribe to all active topics
-            logger.info(f"Session {self.session_id}: Reconnect detected, re-subscribing.")
+        logger.info(f"Session {self.session_id}: MQTT connected (rc={rc}). connected_once={getattr(self, '_connected_once', 'NOT SET YET')}")
+        if getattr(self, '_connected_once', False):
+            logger.info(f"Session {self.session_id}: Reconnect detected, re-subscribing {list(self.subscriptions.keys())}")
             for sub in list(self.subscriptions.values()):
                 self._do_subscribe(sub.topic, sub.purpose)
         self._connected_once = True
@@ -136,6 +135,7 @@ class SessionState:
         """Bridge incoming message from paho thread to asyncio event loop."""
         topic   = str(msg.topic)
         payload = msg.payload.decode(errors="replace")
+        logger.info(f"Session {self.session_id}: message received topic={topic} payload={payload[:80]}")
         data    = {
             "type":      "mqtt_data",
             "topic":     topic,
@@ -324,6 +324,7 @@ class MQTTStreamManager:
 
     async def _forward_to_agent(self, state: SessionState, data: dict):
         url = f"{state.agent_server_url}/agents/{state.session_id}"
+        logger.info(f"Forwarding to agent: {url} topic={data['topic']}")
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
                 resp = await client.post(url, json={
