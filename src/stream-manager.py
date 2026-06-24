@@ -101,7 +101,7 @@ class SessionState:
         )
         self._purpose_client = PurposeSubscribeClient(
             paho_client,
-            log_problems=True,
+            log_problems=False,
             purpose_aware=True,
             presub=presub,
         )
@@ -116,7 +116,7 @@ class SessionState:
         self._paho.connect(broker_url, port, keepalive=60)
         self._paho.loop_start()
         logger.info(f"Session {session_id}: paho client started.")
-
+        
     # ------------------------------------------------------------------
     # Paho callbacks — run on paho's background thread
     # ------------------------------------------------------------------
@@ -148,7 +148,7 @@ class SessionState:
         )
 
     # ------------------------------------------------------------------
-    # Broker operations (called from any thread — paho is thread-safe)
+    # Broker operations 
     # ------------------------------------------------------------------
     def _do_subscribe(self, topic: str, purpose: str):
         try:
@@ -173,6 +173,23 @@ class SessionState:
         self._paho.loop_stop()
         self._paho.disconnect()
         logger.info(f"Session {self.session_id}: paho client stopped.")
+
+    # DEBUG
+    def _do_subscribe_raw(self, topic: str):
+        try:
+            self._paho.subscribe(topic, qos=0)
+            logger.info(f"Session {self.session_id}: RAW broker subscribe topic={topic}")
+        except Exception as e:
+            logger.error(f"Session {self.session_id}: RAW broker subscribe failed for {topic}: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Raw subscribe (bypasses PurposeSubscribeClient — diagnostic)
+# ---------------------------------------------------------------------------
+class RawSubscribeRequest(BaseModel):
+    session_id: str
+    topic: str
+    agent_server_url: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -312,9 +329,22 @@ class MQTTStreamManager:
                     for sub in state.subscriptions.values()
                 ],
             }
+    # DEBUG
+    async def subscribe_raw(self, session_id: str, topic: str) -> str:
+        async with self.state_lock:
+            if session_id not in self.sessions:
+                return "Session not registered."
+            if len(self.sessions[session_id].subscriptions) >= max_topics_per_session:
+                return f"Subscription limit reached."
+            if topic in self.sessions[session_id].subscriptions:
+                return f"Already subscribed to {topic}."
+            self.sessions[session_id].subscriptions[topic] = TopicSubscription(topic, purpose="raw")
+
+        self.sessions[session_id]._do_subscribe_raw(topic)
+        return f"RAW subscribed to {topic}. Data streaming."
 
     # ------------------------------------------------------------------
-    # Forwarding — unchanged from before
+    # Forwarding
     # ------------------------------------------------------------------
     async def _forward(self, state: SessionState, data: dict):
         if state.consumer_type == "browser":
@@ -418,6 +448,16 @@ async def clear_all():
     manager: MQTTStreamManager = app.state.manager
     return await manager.clear_all()
 
+@app.post("/subscribe_raw")
+async def subscribe_raw(req: RawSubscribeRequest):
+    manager: MQTTStreamManager = app.state.manager
+    url = req.agent_server_url or agent_server_url
+    await manager.register_session(
+        session_id=req.session_id,
+        agent_server_url=url,
+    )
+    result = await manager.subscribe_raw(req.session_id, req.topic)
+    return {"session_id": req.session_id, "result": result}
 
 # ---------------------------------------------------------------------------
 # WebSocket endpoint
