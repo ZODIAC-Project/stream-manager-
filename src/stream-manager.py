@@ -122,10 +122,8 @@ class SessionState:
     # ------------------------------------------------------------------
     def _on_connect(self, client, userdata, flags, rc, properties=None):
         logger.info(f"Session {self.session_id}: MQTT connected (rc={rc}). connected_once={getattr(self, '_connected_once', 'NOT SET YET')}")
-        if getattr(self, '_connected_once', False):
-            logger.info(f"Session {self.session_id}: Reconnect detected, re-subscribing {list(self.subscriptions.keys())}")
-            for sub in list(self.subscriptions.values()):
-                self._do_subscribe(sub.topic, sub.purpose)
+        for sub in list(self.subscriptions.values()):
+            self._do_subscribe(sub.topic, sub.purpose)
         self._connected_once = True
 
     def _on_disconnect(self, client, userdata, disconnect_flags, rc, properties=None):
@@ -243,16 +241,15 @@ class MQTTStreamManager:
         async with self.state_lock:
             if session_id not in self.sessions:
                 return "Session not registered."
-
             state = self.sessions[session_id]
             if len(state.subscriptions) >= max_topics_per_session:
                 return f"Subscription limit reached ({max_topics_per_session} topics max)."
             if topic in state.subscriptions:
                 return f"Already subscribed to {topic}."
-
             state.subscriptions[topic] = TopicSubscription(topic, purpose)
 
-        state._do_subscribe(topic, purpose)
+        if state._connected_once:
+            state._do_subscribe(topic, purpose)
 
         logger.info(f"Session {session_id} subscribed to {topic} (purpose={purpose})")
         return f"Subscribed to {topic} with purpose '{purpose}'. Data streaming."
