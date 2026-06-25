@@ -222,6 +222,7 @@ class MQTTStreamManager:
     # ------------------------------------------------------------------
     async def register_session(self, session_id: str, agent_server_url: str,
                                 consumer_type: str = "agent") -> bool:
+        logging.debug(f"Registering session: session_id={session_id}, agent_server_url={agent_server_url}, consumer_type={consumer_type}")
         async with self.state_lock:
             if session_id not in self.sessions:
                 self.sessions[session_id] = SessionState(
@@ -238,6 +239,7 @@ class MQTTStreamManager:
             return False
 
     async def subscribe(self, session_id: str, topic: str, purpose: str) -> str:
+        logging.debug(f"Subscribing session: session_id={session_id}, topic={topic}, purpose={purpose}")
         async with self.state_lock:
             if session_id not in self.sessions:
                 return "Session not registered."
@@ -353,7 +355,7 @@ class MQTTStreamManager:
         url = f"{state.agent_server_url}/agents/{state.session_id}"
         logger.info(f"Forwarding to agent: {url} topic={data['topic']}")
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
+            async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.post(url, json={
                     "datapoint": data["payload"],
                     "topic":     data["topic"],
@@ -416,6 +418,7 @@ async def subscribe(req: SubscribeRequest):
 
 @app.post("/subscribe_browser")
 async def subscribe_browser(req: BrowserSubscribeRequest):
+    logging.debug(f"subscribe_browser called with session_id={req.session_id}, topic={req.topic}, purpose={req.purpose}")
     manager: MQTTStreamManager = app.state.manager
     await manager.register_session(
         session_id=req.session_id,
