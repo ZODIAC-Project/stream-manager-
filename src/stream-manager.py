@@ -355,7 +355,7 @@ class MQTTStreamManager:
         url = f"{state.agent_server_url}/agents/{state.session_id}"
         logger.info(f"Forwarding to agent: {url} topic={data['topic']}")
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(timeout=30.0) as client:
                 resp = await client.post(url, json={
                     "datapoint": data["payload"],
                     "topic":     data["topic"],
